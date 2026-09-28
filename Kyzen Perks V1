@@ -1,14 +1,9 @@
 --[[
-    🔥 KYZEN PERKS — AIM & TARGET SYSTEM (Private Test Environment)
+    🔥 KYZEN PERKS — AIM & TARGET SYSTEM v1.1.1 (Private Test Environment)
+    Credit to KyzenDevs
     LocalScript  →  StarterPlayer > StarterPlayerScripts
 
-    Keybinds:
-        RightShift = Show/Hide menu (o pindutin ang floating "K" button)
-        T          = Target Lock ON/OFF
-        G          = Aim Assist ON/OFF
-
-    Architecture (single source of truth = State.Current):
-        Settings → Target Manager → CurrentTarget → Highlight / Billboard / Camera
+    Keybinds: T = Target Lock | G = Aim Assist | RightShift = Menu
 ]]
 
 local Players = game:GetService("Players")
@@ -20,184 +15,245 @@ local Workspace = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
+local VERSION = "v1.1.1"
+local CREDIT = "Credit to KyzenDevs"
+local TOGGLE_IMAGE = "rbxassetid://129427980084843"
+
 --------------------------------------------------------------------
 -- SETTINGS
 --------------------------------------------------------------------
 local Settings = {
+	TargetSystem = true,
 	TargetLock = false,
 	AimAssist = false,
-	Smoothness = "BALANCED", -- SMOOTH | BALANCED | FAST | INSTANT
-	FOV = 180, -- degrees (360 = full 360° detection)
-	TargetMode = "Smart", -- Smart | Closest | Crosshair
-	TargetRange = 150, -- studs
-	TargetPart = "Head", -- Head | Torso
+	Smoothness = "BALANCED",
+	Detect360 = true,
+	FOVRadius = 260,
+	ShowFOV = true,
+	TargetMode = "Nearest", -- Nearest (closest first) | Smart | Crosshair
+	TargetRange = 200,
+	TargetPart = "Head",
+	IncludeNPC = true,
+	HighlightColor = "Red",
 }
+local Defaults = {}
+for k, v in pairs(Settings) do Defaults[k] = v end
 
 local SMOOTH_ORDER = { "SMOOTH", "BALANCED", "FAST", "INSTANT" }
-local SMOOTH_SPEED = { SMOOTH = 4, BALANCED = 8, FAST = 16, INSTANT = math.huge }
-local MODE_ORDER = { "Smart", "Closest", "Crosshair" }
+local SMOOTH_SPEED = { SMOOTH = 9, BALANCED = 16, FAST = 28, INSTANT = math.huge }
+local MODE_ORDER = { "Nearest", "Smart", "Crosshair" }
 local PART_ORDER = { "Head", "Torso" }
+local HL_ORDER = { "Red", "Cyan", "Green", "Purple", "Gold", "White" }
+local HL_COLORS = {
+	Red = Color3.fromRGB(255, 58, 68),
+	Cyan = Color3.fromRGB(0, 220, 255),
+	Green = Color3.fromRGB(80, 235, 130),
+	Purple = Color3.fromRGB(170, 100, 255),
+	Gold = Color3.fromRGB(255, 205, 60),
+	White = Color3.fromRGB(245, 245, 250),
+}
+local MODE_CFG = {
+	Nearest = { margin = 0.03, stab = 0.02 },
+	Smart = { margin = 0.05, stab = 0.03 },
+	Crosshair = { margin = 0.10, stab = 0.05 },
+}
 
-local SELECT_INTERVAL = 0.05 -- target selection tick (0.04–0.06)
-local SWITCH_MARGIN = 0.12 -- how much better a new target must be
-local STABILITY_BONUS = 0.05 -- bonus for current target (anti-flicker)
-local LOCK_MIN_SPEED = 25
-local TRANSITION_TIME = 0.35
-local TRANSITION_SPEED = 12
+local SELECT_INTERVAL = 0.04
+local LOCK_MIN_SPEED = 42
+local LOCK_SNAP_DEG = 4 -- hard lock when this close (Target Lock)
 
---------------------------------------------------------------------
--- THEME
---------------------------------------------------------------------
 local C = {
-	BG = Color3.fromRGB(13, 13, 18),
-	Panel = Color3.fromRGB(22, 22, 30),
-	Panel2 = Color3.fromRGB(30, 30, 40),
+	BG = Color3.fromRGB(12, 12, 17),
+	Panel = Color3.fromRGB(22, 22, 31),
+	Panel2 = Color3.fromRGB(34, 34, 47),
 	Accent = Color3.fromRGB(255, 58, 68),
-	Accent2 = Color3.fromRGB(255, 120, 90),
-	Text = Color3.fromRGB(240, 240, 246),
-	Muted = Color3.fromRGB(140, 142, 158),
-	Off = Color3.fromRGB(58, 58, 72),
-	Good = Color3.fromRGB(80, 220, 130),
+	Accent2 = Color3.fromRGB(255, 125, 90),
+	Text = Color3.fromRGB(240, 240, 247),
+	Muted = Color3.fromRGB(139, 142, 160),
+	Off = Color3.fromRGB(58, 58, 74),
+	Good = Color3.fromRGB(80, 225, 135),
 }
 
 --------------------------------------------------------------------
--- STATE (single source of truth)
+-- SETTINGS BUS
+--------------------------------------------------------------------
+local Listeners = {}
+local function setSetting(key, value)
+	Settings[key] = value
+	if Listeners[key] then
+		for _, f in ipairs(Listeners[key]) do f(value) end
+	end
+end
+local function listen(key, f)
+	Listeners[key] = Listeners[key] or {}
+	table.insert(Listeners[key], f)
+	f(Settings[key])
+end
+
+--------------------------------------------------------------------
+-- STATE (single source of truth = State.Current)
 --------------------------------------------------------------------
 local State = {
-	Current = nil, -- Player
+	Current = nil,
 	Highlight = nil,
 	Billboard = nil,
 	BillboardRefs = nil,
 	DiedConn = nil,
-	Transition = 0,
 }
 
 --------------------------------------------------------------------
--- HELPERS
+-- ENTITY DISCOVERY
 --------------------------------------------------------------------
+local NPCs = {}
+local function registerHumanoid(h)
+	local m = h.Parent
+	if m and m:IsA("Model") then NPCs[m] = true end
+end
+for _, d in ipairs(Workspace:GetDescendants()) do -- one-time scan
+	if d:IsA("Humanoid") then registerHumanoid(d) end
+end
+Workspace.DescendantAdded:Connect(function(d)
+	if d:IsA("Humanoid") then task.defer(registerHumanoid, d) end
+end)
+
 local function getMyRoot()
 	local char = LocalPlayer.Character
 	return char and char:FindFirstChild("HumanoidRootPart")
 end
 
-local function getParts(player)
-	local char = player.Character
-	if not char then return end
-	local hum = char:FindFirstChildOfClass("Humanoid")
+local function getParts(model)
+	if not model or not model.Parent or not model:IsDescendantOf(Workspace) then return end
+	local hum = model:FindFirstChildOfClass("Humanoid")
 	if not hum or hum.Health <= 0 then return end
-	local root = char:FindFirstChild("HumanoidRootPart")
-	if not root then return end
-	local head = char:FindFirstChild("Head")
-	if not head then return end
-	return char, hum, root, head
+	local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+		or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso")
+	if not root or not root:IsA("BasePart") then return end
+	local head = model:FindFirstChild("Head")
+	if not head or not head:IsA("BasePart") then head = root end
+	return hum, root, head
 end
 
-local function getAimPart(char)
-	local head = char:FindFirstChild("Head")
-	if Settings.TargetPart == "Head" and head then
-		return head
-	end
+local function getAimPart(model)
+	local _, root, head = getParts(model)
+	if not root then return nil end
 	if Settings.TargetPart == "Torso" then
-		local t = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
-		if t then return t end
+		local t = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+		if t and t:IsA("BasePart") then return t end
+		return root
 	end
-	return head or char:FindFirstChild("HumanoidRootPart")
+	return head
 end
 
---------------------------------------------------------------------
--- TARGET VALIDATION
---------------------------------------------------------------------
-local function isValid(player)
-	if not player or player == LocalPlayer or player.Parent ~= Players then return false end
-	local char, _, root = getParts(player)
-	if not char then return false end
+local function describe(model)
+	local p = Players:GetPlayerFromCharacter(model)
+	if p then
+		local nm = (p.DisplayName ~= p.Name) and (p.DisplayName .. "  @" .. p.Name) or ("@" .. p.Name)
+		return nm, "PLAYER"
+	end
+	return "NPC · " .. model.Name, "NPC"
+end
+
+local function isValid(model)
+	if not model or model == LocalPlayer.Character then return false end
+	local hum, root = getParts(model)
+	if not hum then return false end
+	if not Players:GetPlayerFromCharacter(model) and not Settings.IncludeNPC then return false end
 	local myRoot = getMyRoot()
 	if not myRoot then return false end
 	return (root.Position - myRoot.Position).Magnitude <= Settings.TargetRange
 end
 
+local function getCandidates()
+	local list = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LocalPlayer and p.Character then list[#list + 1] = p.Character end
+	end
+	if Settings.IncludeNPC then
+		for m in pairs(NPCs) do
+			if not m.Parent then
+				NPCs[m] = nil
+			elseif m ~= LocalPlayer.Character and not Players:GetPlayerFromCharacter(m) then
+				list[#list + 1] = m
+			end
+		end
+	end
+	return list
+end
+
 --------------------------------------------------------------------
--- SMART SCORING
+-- SCORING (nearest player gets priority)
 --------------------------------------------------------------------
-local function scorePlayer(player, ignoreFOV, isCurrent)
-	local char, _, root = getParts(player)
-	if not char then return nil end
+local function scoreModel(model, ignoreFOV, isCurrent)
+	local hum, root = getParts(model)
+	if not hum then return nil end
 	local myRoot = getMyRoot()
 	local cam = Workspace.CurrentCamera
 	if not myRoot or not cam then return nil end
-
-	local aimPart = getAimPart(char)
-	if not aimPart then return nil end
+	local part = getAimPart(model)
+	if not part then return nil end
 
 	local dist = (root.Position - myRoot.Position).Magnitude
-	local toTarget = aimPart.Position - cam.CFrame.Position
-	if toTarget.Magnitude < 0.01 then return nil end
+	local toT = part.Position - cam.CFrame.Position
+	if toT.Magnitude < 0.01 then return nil end
 
-	local dot = math.clamp(cam.CFrame.LookVector:Dot(toTarget.Unit), -1, 1)
-	local angle = math.deg(math.acos(dot))
-	if not ignoreFOV and angle > Settings.FOV / 2 then return nil end
+	local angle = math.deg(math.acos(math.clamp(cam.CFrame.LookVector:Dot(toT.Unit), -1, 1)))
+	local vp = cam:WorldToViewportPoint(part.Position)
+	local center = cam.ViewportSize / 2
+	local pxDist = (vp.Z > 0) and (Vector2.new(vp.X, vp.Y) - center).Magnitude or math.huge
+	local inCircle = pxDist <= Settings.FOVRadius
 
-	local distScore = 1 - math.clamp(dist / Settings.TargetRange, 0, 1)
+	if not ignoreFOV and not Settings.Detect360 and not inCircle then return nil end
+
+	local nearScore = 1 / (1 + dist / 20) -- closer = much higher
 	local angScore = 1 - angle / 180
+	local circleScore = inCircle and (1 - pxDist / Settings.FOVRadius) or 0
 
-	local screenScore = 0
-	local vp, onScreen = cam:WorldToViewportPoint(aimPart.Position)
-	if onScreen then
-		local vs = cam.ViewportSize
-		local d = (Vector2.new(vp.X, vp.Y) - vs / 2).Magnitude
-		screenScore = 1 - math.min(d / (vs.Magnitude / 2), 1)
-	end
-
+	local mode = Settings.TargetMode
 	local score
-	if Settings.TargetMode == "Closest" then
-		score = distScore
-	elseif Settings.TargetMode == "Crosshair" then
-		score = angScore * 0.8 + screenScore * 0.2
-	else -- Smart
-		score = distScore * 0.35 + angScore * 0.45 + screenScore * 0.20
+	if mode == "Nearest" then
+		score = nearScore * 0.9 + angScore * 0.05 + circleScore * 0.05
+	elseif mode == "Crosshair" then
+		score = angScore * 0.6 + circleScore * 0.4
+	else -- Smart (distance-dominant)
+		score = nearScore * 0.7 + angScore * 0.15 + circleScore * 0.15
 	end
-
-	if isCurrent then
-		score += STABILITY_BONUS
-	end
+	if isCurrent then score += MODE_CFG[mode].stab end
 	return score
 end
 
 --------------------------------------------------------------------
--- HIGHLIGHT + BILLBOARD BUILDERS
+-- HIGHLIGHT + BILLBOARD
 --------------------------------------------------------------------
-local function buildHighlight(char)
+local function buildHighlight(model)
 	local h = Instance.new("Highlight")
 	h.Name = "TargetHighlight"
-	h.Adornee = char
-	h.FillColor = C.Accent
-	h.OutlineColor = Color3.fromRGB(255, 190, 190)
+	h.Adornee = model
+	h.FillColor = HL_COLORS[Settings.HighlightColor]
+	h.OutlineColor = Color3.fromRGB(255, 255, 255)
 	h.FillTransparency = 0.5
 	h.OutlineTransparency = 0
-	h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop -- visible kahit may wall
-	h.Parent = char
+	h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	h.Parent = model
 	return h
 end
 
-local function buildBillboard(char, head)
+local function buildBillboard(model, head)
 	local bb = Instance.new("BillboardGui")
 	bb.Name = "TargetBillboard"
 	bb.Adornee = head
 	bb.AlwaysOnTop = true
-	bb.Size = UDim2.fromOffset(190, 78)
-	bb.StudsOffset = Vector3.new(0, 2.8, 0)
+	bb.Size = UDim2.fromOffset(210, 84)
+	bb.StudsOffset = Vector3.new(0, 3, 0)
 	bb.LightInfluence = 0
 	bb.MaxDistance = math.huge
 	bb.ResetOnSpawn = false
 
 	local list = Instance.new("UIListLayout")
-	list.FillDirection = Enum.FillDirection.Vertical
 	list.HorizontalAlignment = Enum.HorizontalAlignment.Center
 	list.VerticalAlignment = Enum.VerticalAlignment.Center
-	list.Padding = UDim.new(0, 0)
 	list.Parent = bb
 
-	local function label(name, size, font, color, height, order)
+	local function label(name, size, font, color, height, order, text)
 		local l = Instance.new("TextLabel")
 		l.Name = name
 		l.BackgroundTransparency = 1
@@ -205,82 +261,70 @@ local function buildBillboard(char, head)
 		l.Font = font
 		l.TextSize = size
 		l.TextColor3 = color
-		l.TextStrokeTransparency = 0.35
+		l.TextStrokeTransparency = 0.3
 		l.TextStrokeColor3 = Color3.new(0, 0, 0)
 		l.LayoutOrder = order
-		l.Text = ""
+		l.Text = text or ""
 		l.Parent = bb
 		return l
 	end
 
-	local title = label("Text", 28, Enum.Font.GothamBlack, C.Accent, 32, 1) -- "TARGET"
-	title.Text = "TARGET"
+	local title = label("Text", 30, Enum.Font.GothamBlack, HL_COLORS[Settings.HighlightColor], 34, 1, "TARGET")
 	local nameL = label("Name", 16, Enum.Font.GothamBold, C.Text, 20, 2)
-	local distL = label("Distance", 14, Enum.Font.GothamMedium, Color3.fromRGB(255, 200, 200), 18, 3)
-
-	bb.Parent = char
-	return bb, { Name = nameL, Distance = distL }
+	local distL = label("Distance", 14, Enum.Font.GothamMedium, Color3.fromRGB(255, 235, 235), 18, 3)
+	bb.Parent = model
+	return bb, { Title = title, Name = nameL, Distance = distL }
 end
 
---------------------------------------------------------------------
--- TARGET STATE CONTROL
---------------------------------------------------------------------
 local function updateBillboardText()
-	local target = State.Current
+	local model = State.Current
 	local refs = State.BillboardRefs
-	if not target or not refs then return end
-	local _, _, root = getParts(target)
+	if not model or not refs then return end
+	local _, root = getParts(model)
 	local myRoot = getMyRoot()
 	if not root or not myRoot then return end
-
-	local disp, user = target.DisplayName, target.Name
-	local nameText = (disp ~= user) and string.format("%s  @%s", disp, user) or ("@" .. user)
-	if refs.Name.Text ~= nameText then
-		refs.Name.Text = nameText
-	end
+	local nameText = describe(model)
+	if refs.Name.Text ~= nameText then refs.Name.Text = nameText end
 	refs.Distance.Text = string.format("%.1f studs", (root.Position - myRoot.Position).Magnitude)
 end
 
+listen("HighlightColor", function(v)
+	local col = HL_COLORS[v] or HL_COLORS.Red
+	if State.Highlight then State.Highlight.FillColor = col end
+	if State.BillboardRefs then State.BillboardRefs.Title.TextColor3 = col end
+end)
+
+--------------------------------------------------------------------
+-- TARGET CONTROL
+--------------------------------------------------------------------
 local function clearTarget()
-	if State.DiedConn then
-		State.DiedConn:Disconnect()
-		State.DiedConn = nil
-	end
-	if State.Highlight then
-		State.Highlight:Destroy()
-		State.Highlight = nil
-	end
-	if State.Billboard then
-		State.Billboard:Destroy()
-		State.Billboard = nil
-	end
+	if State.DiedConn then State.DiedConn:Disconnect() State.DiedConn = nil end
+	if State.Highlight then State.Highlight:Destroy() State.Highlight = nil end
+	if State.Billboard then State.Billboard:Destroy() State.Billboard = nil end
 	State.BillboardRefs = nil
 	State.Current = nil
 end
 
-local updateTarget -- forward declaration
+local updateTarget
 
-local function setTarget(player)
-	clearTarget() -- old Highlight OFF + old Billboard OFF (walang stuck)
-	local char, hum, _, head = getParts(player)
-	if not char then return end
-
-	State.Current = player
-	State.Transition = TRANSITION_TIME
-	State.Highlight = buildHighlight(char)
-	State.Billboard, State.BillboardRefs = buildBillboard(char, head)
+local function setTarget(model)
+	clearTarget()
+	local hum, _, head = getParts(model)
+	if not hum then return end
+	State.Current = model
+	State.Highlight = buildHighlight(model)
+	State.Billboard, State.BillboardRefs = buildBillboard(model, head)
 	updateBillboardText()
-
 	State.DiedConn = hum.Died:Connect(function()
-		if State.Current == player then
+		if State.Current == model then
 			clearTarget()
-			updateTarget() -- immediate replacement
+			updateTarget()
 		end
 	end)
 end
 
 updateTarget = function()
-	if not (Settings.TargetLock or Settings.AimAssist) then
+	if not (Settings.TargetSystem or Settings.TargetLock or Settings.AimAssist) then
 		if State.Current then clearTarget() end
 		return
 	end
@@ -289,7 +333,7 @@ updateTarget = function()
 	local curScore
 	if cur then
 		if isValid(cur) then
-			curScore = scorePlayer(cur, Settings.TargetLock, true)
+			curScore = scoreModel(cur, Settings.TargetLock, true)
 		else
 			clearTarget()
 			cur = nil
@@ -297,22 +341,76 @@ updateTarget = function()
 	end
 
 	local best, bestScore
-	for _, p in ipairs(Players:GetPlayers()) do
-		if p ~= cur and isValid(p) then
-			local s = scorePlayer(p, false, false)
-			if s and (not bestScore or s > bestScore) then
-				best, bestScore = p, s
-			end
+	for _, m in ipairs(getCandidates()) do
+		if m ~= cur and isValid(m) then
+			local s = scoreModel(m, false, false)
+			if s and (not bestScore or s > bestScore) then best, bestScore = m, s end
 		end
 	end
 
 	if best then
-		if not cur or not curScore or bestScore > curScore + SWITCH_MARGIN then
+		if not cur or not curScore or bestScore > curScore + MODE_CFG[Settings.TargetMode].margin then
 			setTarget(best)
 		end
 	elseif cur and not curScore then
 		clearTarget()
 	end
+end
+
+--------------------------------------------------------------------
+-- CAMERA (fast turn, smooth ease-out, no roll, shortest 360° path)
+--------------------------------------------------------------------
+local function applyCamera(dt, model)
+	local cam = Workspace.CurrentCamera
+	local myChar = LocalPlayer.Character
+	local myHead = myChar and (myChar:FindFirstChild("Head") or myChar:FindFirstChild("HumanoidRootPart"))
+	local part = getAimPart(model)
+	if not cam or not myHead or not part then return end
+
+	local focus = myHead.Position
+	local cf = cam.CFrame
+	local dist = math.clamp((cf.Position - focus).Magnitude, 0, 40)
+
+	local dir = part.Position - focus
+	if dir.Magnitude < 0.05 then return end
+	local dirU = dir.Unit
+
+	local curLook = cf.LookVector
+	local curYaw = math.atan2(-curLook.X, -curLook.Z)
+	local curPitch = math.asin(math.clamp(curLook.Y, -1, 1))
+	local gYaw = math.atan2(-dirU.X, -dirU.Z)
+	local gPitch = math.asin(math.clamp(dirU.Y, -1, 1))
+
+	local dYaw = (gYaw - curYaw + math.pi) % (2 * math.pi) - math.pi -- shortest turn
+	local dPitch = gPitch - curPitch
+	local angDeg = math.deg(math.sqrt(dYaw * dYaw + dPitch * dPitch))
+
+	local base = SMOOTH_SPEED[Settings.Smoothness]
+	local alpha
+	if base == math.huge then
+		alpha = 1
+	else
+		local speed = base
+		if Settings.TargetLock then speed = math.max(speed, LOCK_MIN_SPEED) end
+		speed *= 1 + math.clamp(angDeg / 40, 0, 4) -- farther = faster (fast 360° switch)
+		alpha = 1 - math.exp(-speed * dt) -- frame-rate independent
+		if Settings.TargetLock and angDeg < LOCK_SNAP_DEG then alpha = 1 end
+	end
+
+	local yaw = curYaw + dYaw * alpha
+	local pitch = math.clamp(curPitch + dPitch * alpha, -1.4, 1.4)
+	local rot = CFrame.fromOrientation(pitch, yaw, 0)
+
+	local lookV = rot.LookVector
+	local desired = focus - lookV * dist
+	if dist > 1 then
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { myChar }
+		local res = Workspace:Raycast(focus, -lookV * dist, params)
+		if res then desired = focus - lookV * math.max(res.Distance - 0.3, 0.5) end
+	end
+	cam.CFrame = CFrame.new(desired) * rot
 end
 
 --------------------------------------------------------------------
@@ -329,50 +427,26 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 RunService:BindToRenderStep("KyzenTargetCamera", Enum.RenderPriority.Camera.Value + 1, function(dt)
-	local target = State.Current
-	if not target then return end
+	local model = State.Current
+	if not model then return end
 
-	-- Highlight pulse
 	if State.Highlight then
-		local t = os.clock()
-		State.Highlight.FillTransparency = 0.55 + 0.22 * math.sin(t * 5)
-		State.Highlight.OutlineTransparency = 0.05 + 0.1 * (0.5 + 0.5 * math.sin(t * 5))
+		State.Highlight.FillTransparency = 0.55 + 0.22 * math.sin(os.clock() * 5)
 	end
 
-	-- Billboard (lightweight update)
 	billboardAcc += dt
 	if billboardAcc >= 0.05 then
 		billboardAcc = 0
 		updateBillboardText()
 	end
 
-	-- Camera: Target Lock / Aim Assist
-	if not (Settings.TargetLock or Settings.AimAssist) then return end
-	local char, _, _, _ = getParts(target)
-	if not char then return end
-	local part = getAimPart(char)
-	local cam = Workspace.CurrentCamera
-	if not part or not cam then return end
-
-	local base = SMOOTH_SPEED[Settings.Smoothness]
-	local speed = base
-	if Settings.TargetLock and base ~= math.huge then
-		speed = math.max(base, LOCK_MIN_SPEED)
+	if Settings.TargetLock or Settings.AimAssist then
+		applyCamera(dt, model)
 	end
-	if State.Transition > 0 then
-		State.Transition -= dt
-		if speed ~= math.huge then
-			speed = math.min(speed, TRANSITION_SPEED)
-		end
-	end
-
-	local goal = CFrame.lookAt(cam.CFrame.Position, part.Position)
-	local alpha = (speed == math.huge) and 1 or (1 - math.exp(-speed * dt)) -- frame-rate independent
-	cam.CFrame = cam.CFrame:Lerp(goal, alpha)
 end)
 
 --------------------------------------------------------------------
--- GUI
+-- GUI HELPERS
 --------------------------------------------------------------------
 local old = PlayerGui:FindFirstChild("KyzenPerksGui")
 if old then old:Destroy() end
@@ -386,492 +460,695 @@ local function new(class, props, children)
 	inst.Parent = parent
 	return inst
 end
-
 local function corner(r) return new("UICorner", { CornerRadius = UDim.new(0, r) }) end
 local function stroke(color, th, tr)
 	return new("UIStroke", { Color = color, Thickness = th or 1, Transparency = tr or 0, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
 end
-local function tween(inst, t, props)
-	TweenService:Create(inst, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+local function tweenE(inst, t, props, style, dir)
+	TweenService:Create(inst, TweenInfo.new(t, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props):Play()
+end
+local function tween(inst, t, props) tweenE(inst, t, props) end
+
+local function sheen(inst, rot)
+	return new("UIGradient", {
+		Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(150, 150, 165)),
+		Rotation = rot or 90, Parent = inst,
+	})
+end
+
+-- idle animation registry (stroke pulse + gradient spin/slide)
+local Idles = {}
+local function idle(o)
+	o.P = math.random() * 6.283
+	Idles[#Idles + 1] = o
+end
+RunService.Heartbeat:Connect(function()
+	local t = os.clock()
+	for i = #Idles, 1, -1 do
+		local o = Idles[i]
+		local ref = o.S or o.G
+		if not ref or not ref.Parent then
+			table.remove(Idles, i)
+		else
+			if o.S then o.S.Transparency = math.clamp(o.B + o.A * math.sin(t * 2.2 + o.P), 0, 1) end
+			if o.G then
+				if o.Spin then
+					o.G.Rotation = (t * o.Spin + o.P * 57) % 360
+				elseif o.Slide then
+					o.G.Offset = Vector2.new(math.sin(t * 1.4 + o.P) * 0.35, 0)
+				end
+			end
+		end
+	end
+end)
+
+-- corner + sheen gradient + stroke + idle animation in one call
+local function decorate(inst, r, strokeColor, base, amp, spin)
+	corner(r).Parent = inst
+	local g = sheen(inst, 90)
+	local s = stroke(strokeColor or C.Accent, 1.2, base or 0.6)
+	s.Parent = inst
+	idle({ S = s, B = base or 0.6, A = amp or 0.15, G = g, Spin = spin or 14 })
+	return s, g
+end
+
+-- hover / press / release-bounce animation
+local function pressable(btn, hoverScale)
+	hoverScale = hoverScale or 1.05
+	local sc = Instance.new("UIScale")
+	sc.Parent = btn
+	local st = btn:FindFirstChildOfClass("UIStroke")
+	local hovering = false
+	btn.MouseEnter:Connect(function()
+		hovering = true
+		tween(sc, 0.12, { Scale = hoverScale })
+	end)
+	btn.MouseLeave:Connect(function()
+		hovering = false
+		tween(sc, 0.15, { Scale = 1 })
+	end)
+	btn.MouseButton1Down:Connect(function()
+		tween(sc, 0.06, { Scale = 0.92 })
+		if st then tween(st, 0.06, { Thickness = 3 }) end
+	end)
+	btn.MouseButton1Up:Connect(function()
+		local target = (hovering and not UserInputService.TouchEnabled) and hoverScale or 1
+		tweenE(sc, 0.22, { Scale = target }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		if st then tween(st, 0.2, { Thickness = 1.2 }) end
+	end)
+end
+
+local function makeDraggable(handle, target, scaleObj, onClick)
+	local dragging, moved, active, startInput, startPos = false, false, nil, nil, nil
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved, active = true, false, input
+			startInput = input.Position
+			startPos = target.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					if dragging and not moved and onClick then onClick() end
+					dragging = false
+				end
+			end)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then return end
+		local isMove = input.UserInputType == Enum.UserInputType.MouseMovement
+			or (input.UserInputType == Enum.UserInputType.Touch and input == active)
+		if not isMove then return end
+		local d = input.Position - startInput
+		if d.Magnitude > 6 then moved = true end
+		if moved then
+			local s = scaleObj and scaleObj.Scale or 1
+			target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X / s, startPos.Y.Scale, startPos.Y.Offset + d.Y / s)
+		end
+	end)
 end
 
 local Gui = new("ScreenGui", {
-	Name = "KyzenPerksGui",
-	ResetOnSpawn = false,
-	IgnoreGuiInset = true,
-	DisplayOrder = 999,
-	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-	Parent = PlayerGui,
+	Name = "KyzenPerksGui", ResetOnSpawn = false, IgnoreGuiInset = true,
+	DisplayOrder = 999, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = PlayerGui,
 })
 
--- Main window
-local Main = new("Frame", {
-	Name = "Main",
-	Size = UDim2.fromOffset(320, 500),
-	Position = UDim2.new(0, 70, 0.5, -250),
-	BackgroundColor3 = C.BG,
-	BorderSizePixel = 0,
-	Active = true,
-	Parent = Gui,
-}, { corner(14), stroke(C.Accent, 1.5, 0.4), new("UIScale", { Name = "Scale" }) })
+--------------------------------------------------------------------
+-- FOV CIRCLE (center, adjustable)
+--------------------------------------------------------------------
+local Circle = new("Frame", {
+	Name = "FOVCircle", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(520, 520), BackgroundColor3 = C.Accent, BackgroundTransparency = 0.94,
+	BorderSizePixel = 0, Active = false, ZIndex = 1, Parent = Gui,
+}, { new("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+local CircleStroke = stroke(C.Accent, 2, 0.15)
+CircleStroke.Parent = Circle
+local CircleGrad = new("UIGradient", {
+	Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(170, 170, 180)), Parent = CircleStroke,
+})
+idle({ S = CircleStroke, B = 0.25, A = 0.12, G = CircleGrad, Spin = 40 })
+new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(5, 5), BackgroundColor3 = C.Text, BorderSizePixel = 0, Parent = Circle,
+}, { new("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+local CircleLabel = new("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 0, -4),
+	Size = UDim2.fromOffset(300, 16), BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = C.Accent,
+	TextStrokeTransparency = 0.6, Text = "", Parent = Circle,
+})
+listen("FOVRadius", function(v) Circle.Size = UDim2.fromOffset(v * 2, v * 2) end)
+listen("ShowFOV", function(v) Circle.Visible = v end)
+listen("Detect360", function(v)
+	CircleLabel.Text = v and "360° DETECTION  •  PRIORITY ZONE" or "FOV DETECTION  •  HARD LIMIT"
+end)
 
+--------------------------------------------------------------------
+-- HUD PILLS (top center — unchanged)
+--------------------------------------------------------------------
+local Hud = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 8),
+	Size = UDim2.fromOffset(236, 32), BackgroundTransparency = 1, Parent = Gui,
+}, { new("UIListLayout", {
+	FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8),
+	HorizontalAlignment = Enum.HorizontalAlignment.Center,
+}) })
+
+local function pill(text, key)
+	local b = new("TextButton", {
+		Size = UDim2.fromOffset(114, 32), BackgroundColor3 = C.Panel, Text = "",
+		Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = C.Text, AutoButtonColor = false, Parent = Hud,
+	}, { corner(16), stroke(C.Accent, 1.5, 0.3) })
+	listen(key, function(v)
+		b.Text = text .. (v and "  ON" or "  OFF")
+		tween(b, 0.15, { BackgroundColor3 = v and C.Accent or C.Panel })
+	end)
+	b.MouseButton1Click:Connect(function() setSetting(key, not Settings[key]) end)
+end
+pill("🔒 LOCK", "TargetLock")
+pill("🎯 AIM", "AimAssist")
+
+--------------------------------------------------------------------
+-- MAIN WINDOW
+--------------------------------------------------------------------
+local MAIN_W, MAIN_H, HEADER_H = 560, 360, 50
+
+local Main = new("Frame", {
+	Name = "Main", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.2),
+	Size = UDim2.fromOffset(MAIN_W, MAIN_H), BackgroundColor3 = C.BG, BorderSizePixel = 0,
+	Active = true, ClipsDescendants = true, ZIndex = 5, Parent = Gui,
+}, {
+	corner(16),
+	new("UIScale", { Name = "Scale" }),
+	new("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.fromRGB(26, 20, 32), Color3.fromRGB(11, 11, 16)) }),
+})
+local MainStroke = stroke(Color3.new(1, 1, 1), 1.8, 0.05)
+MainStroke.Parent = Main
+local MainStrokeGrad = new("UIGradient", { Color = ColorSequence.new(C.Accent, C.Accent2), Parent = MainStroke })
+idle({ S = MainStroke, B = 0.1, A = 0.1, G = MainStrokeGrad, Spin = 50 })
+
+local baseScale = 1
 local function rescale()
 	local vs = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
-	Main.Scale.Scale = math.clamp(vs.Y / 640, 0.6, 1)
+	baseScale = math.clamp(math.min(vs.X / (MAIN_W + 40), vs.Y / (MAIN_H + 40)), 0.5, 1)
+	Main.Scale.Scale = baseScale
+	return vs
 end
-rescale()
+do
+	local vs = rescale()
+	Main.Position = UDim2.fromScale(0.5, math.max(0.02, 0.5 - (MAIN_H * baseScale / 2) / vs.Y))
+end
 if Workspace.CurrentCamera then
 	Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(rescale)
 end
 
 -- Header
 local Header = new("Frame", {
-	Name = "Header",
-	Size = UDim2.new(1, 0, 0, 48),
-	BackgroundColor3 = C.Panel,
-	BorderSizePixel = 0,
-	Parent = Main,
-}, { corner(14) })
-new("Frame", { -- square off bottom corners of header
-	Size = UDim2.new(1, 0, 0, 14),
-	Position = UDim2.new(0, 0, 1, -14),
-	BackgroundColor3 = C.Panel,
-	BorderSizePixel = 0,
-	Parent = Header,
-})
+	Name = "Header", Size = UDim2.new(1, 0, 0, HEADER_H), BackgroundColor3 = C.Panel,
+	BorderSizePixel = 0, Active = true, ZIndex = 6, Parent = Main,
+}, { corner(16), new("UIGradient", { Rotation = 0, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(150, 130, 140)) }) })
 new("Frame", {
-	Size = UDim2.new(1, 0, 0, 2),
-	Position = UDim2.new(0, 0, 1, -2),
-	BorderSizePixel = 0,
-	BackgroundColor3 = Color3.new(1, 1, 1),
-	Parent = Header,
-}, { new("UIGradient", { Color = ColorSequence.new(C.Accent, C.Accent2) }) })
+	Size = UDim2.new(1, 0, 0, 16), Position = UDim2.new(0, 0, 1, -16),
+	BackgroundColor3 = C.Panel, BorderSizePixel = 0, ZIndex = 6, Parent = Header,
+}, { new("UIGradient", { Rotation = 0, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(150, 130, 140)) }) })
+local HeaderLineGrad = new("UIGradient", { Color = ColorSequence.new(C.Accent, C.Accent2) })
+new("Frame", {
+	Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2),
+	BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 7, Parent = Header,
+}, { HeaderLineGrad })
+idle({ G = HeaderLineGrad, Slide = true })
 
-new("TextLabel", {
-	BackgroundTransparency = 1,
-	Position = UDim2.fromOffset(14, 5),
-	Size = UDim2.new(1, -80, 0, 24),
-	Font = Enum.Font.GothamBlack,
-	Text = "🔥 KYZEN PERKS",
-	TextSize = 18,
-	TextColor3 = C.Text,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	Parent = Header,
+local TitleL = new("TextLabel", {
+	BackgroundTransparency = 1, Position = UDim2.fromOffset(16, 5), Size = UDim2.new(1, -110, 0, 26),
+	Font = Enum.Font.GothamBlack, Text = "🔥 KYZEN PERKS", TextSize = 20, TextColor3 = Color3.new(1, 1, 1),
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 8, Parent = Header,
 })
+local TitleGrad = new("UIGradient", { Color = ColorSequence.new(Color3.new(1, 1, 1), C.Accent2), Parent = TitleL })
+idle({ G = TitleGrad, Slide = true })
 new("TextLabel", {
-	BackgroundTransparency = 1,
-	Position = UDim2.fromOffset(14, 27),
-	Size = UDim2.new(1, -80, 0, 16),
-	Font = Enum.Font.GothamMedium,
-	Text = "AIM & TARGET",
-	TextSize = 12,
-	TextColor3 = C.Accent,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	Parent = Header,
+	BackgroundTransparency = 1, Position = UDim2.fromOffset(16, 30), Size = UDim2.new(1, -110, 0, 16),
+	Font = Enum.Font.GothamMedium, Text = "AIM & TARGET  •  " .. VERSION, TextSize = 12, TextColor3 = C.Accent,
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 8, Parent = Header,
 })
 
 local MinBtn = new("TextButton", {
-	Size = UDim2.fromOffset(30, 30),
-	Position = UDim2.new(1, -74, 0, 9),
-	BackgroundColor3 = C.Panel2,
-	Text = "–",
-	Font = Enum.Font.GothamBold,
-	TextSize = 18,
-	TextColor3 = C.Text,
-	AutoButtonColor = true,
-	Parent = Header,
-}, { corner(8) })
+	Size = UDim2.fromOffset(32, 32), Position = UDim2.new(1, -80, 0, 9), BackgroundColor3 = C.Panel2,
+	Text = "–", Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = C.Text, AutoButtonColor = false, ZIndex = 8, Parent = Header,
+})
+decorate(MinBtn, 9, C.Accent, 0.55, 0.2)
+pressable(MinBtn, 1.1)
 local CloseBtn = new("TextButton", {
-	Size = UDim2.fromOffset(30, 30),
-	Position = UDim2.new(1, -38, 0, 9),
-	BackgroundColor3 = C.Accent,
-	Text = "✕",
-	Font = Enum.Font.GothamBold,
-	TextSize = 14,
-	TextColor3 = C.Text,
-	Parent = Header,
-}, { corner(8) })
+	Size = UDim2.fromOffset(32, 32), Position = UDim2.new(1, -42, 0, 9), BackgroundColor3 = C.Accent,
+	Text = "X", Font = Enum.Font.GothamBlack, TextSize = 16, TextColor3 = C.Text, AutoButtonColor = false, ZIndex = 8, Parent = Header,
+})
+decorate(CloseBtn, 9, Color3.new(1, 1, 1), 0.6, 0.2)
+pressable(CloseBtn, 1.1)
 
--- Body
+makeDraggable(Header, Main, Main.Scale, nil)
+
+-- Body (sidebar + content)
 local Body = new("Frame", {
-	Name = "Body",
-	Position = UDim2.fromOffset(0, 52),
-	Size = UDim2.new(1, 0, 1, -52),
-	BackgroundTransparency = 1,
-	Parent = Main,
+	Name = "Body", Position = UDim2.fromOffset(0, HEADER_H), Size = UDim2.new(1, 0, 1, -HEADER_H),
+	BackgroundTransparency = 1, ZIndex = 6, Parent = Main,
+})
+local Sidebar = new("Frame", {
+	Position = UDim2.fromOffset(10, 8), Size = UDim2.new(0, 128, 1, -18),
+	BackgroundColor3 = C.Panel, ZIndex = 6, Parent = Body,
+})
+decorate(Sidebar, 12, C.Accent, 0.75, 0.1, 10)
+local Content = new("Frame", {
+	Position = UDim2.fromOffset(146, 8), Size = UDim2.new(1, -156, 1, -18),
+	BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 6, Parent = Body,
 })
 
--- Status card
-local Status = new("Frame", {
-	Position = UDim2.fromOffset(10, 4),
-	Size = UDim2.new(1, -20, 0, 62),
-	BackgroundColor3 = C.Panel,
-	Parent = Body,
-}, { corner(10), stroke(C.Panel2, 1) })
-local StatusDot = new("Frame", {
-	Position = UDim2.fromOffset(14, 14),
-	Size = UDim2.fromOffset(10, 10),
-	BackgroundColor3 = C.Off,
-	Parent = Status,
-}, { corner(5) })
+-- Sidebar footer hints + credit
 new("TextLabel", {
-	BackgroundTransparency = 1,
-	Position = UDim2.fromOffset(32, 8),
-	Size = UDim2.new(1, -40, 0, 20),
-	Font = Enum.Font.GothamBold,
-	Text = "CURRENT TARGET",
-	TextSize = 11,
-	TextColor3 = C.Muted,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	Parent = Status,
+	AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 12, 1, -26), Size = UDim2.new(1, -24, 0, 44),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = C.Muted,
+	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Bottom,
+	Text = "T  •  Lock\nG  •  Aim Assist\nRShift  •  Menu", ZIndex = 8, Parent = Sidebar,
 })
-local StatusName = new("TextLabel", {
-	BackgroundTransparency = 1,
-	Position = UDim2.fromOffset(14, 28),
-	Size = UDim2.new(1, -28, 0, 20),
-	Font = Enum.Font.GothamBold,
-	Text = "No target",
-	TextSize = 16,
-	TextColor3 = C.Text,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	TextTruncate = Enum.TextTruncate.AtEnd,
-	Parent = Status,
+local CreditL = new("TextLabel", {
+	AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 12, 1, -8), Size = UDim2.new(1, -24, 0, 14),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = Color3.new(1, 1, 1),
+	TextXAlignment = Enum.TextXAlignment.Left, Text = CREDIT, ZIndex = 8, Parent = Sidebar,
 })
-local StatusDist = new("TextLabel", {
-	BackgroundTransparency = 1,
-	Position = UDim2.fromOffset(14, 44),
-	Size = UDim2.new(1, -28, 0, 14),
-	Font = Enum.Font.Gotham,
-	Text = "—",
-	TextSize = 12,
-	TextColor3 = C.Muted,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	Parent = Status,
-})
+local CreditGrad = new("UIGradient", { Color = ColorSequence.new(C.Accent, C.Accent2, C.Accent), Parent = CreditL })
+idle({ G = CreditGrad, Slide = true })
 
--- Scroll area
-local Scroll = new("ScrollingFrame", {
-	Position = UDim2.fromOffset(0, 72),
-	Size = UDim2.new(1, 0, 1, -72),
-	BackgroundTransparency = 1,
-	BorderSizePixel = 0,
-	ScrollBarThickness = 3,
-	ScrollBarImageColor3 = C.Accent,
-	CanvasSize = UDim2.new(),
-	AutomaticCanvasSize = Enum.AutomaticSize.Y,
-	Parent = Body,
-}, {
-	new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
-	new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10), PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 12) }),
-})
+-- Pages
+local function makePage()
+	local cg = new("CanvasGroup", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false,
+		GroupTransparency = 1, ZIndex = 7, Parent = Content,
+	})
+	local sc = new("ScrollingFrame", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 3, ScrollBarImageColor3 = C.Accent, CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 7, Parent = cg,
+	}, {
+		new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+		new("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 12) }),
+	})
+	return cg, sc
+end
+local PageAim, ScrollAim = makePage()
+local PageSet, ScrollSet = makePage()
 
-local order = 0
-local function nextOrder() order += 1 return order end
+local orders = {}
+local function nextOrder(p) orders[p] = (orders[p] or 0) + 1 return orders[p] end
 
-local function section(text)
+local function section(parent, text)
 	new("TextLabel", {
-		LayoutOrder = nextOrder(),
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 18),
-		Font = Enum.Font.GothamBold,
-		Text = text,
-		TextSize = 11,
-		TextColor3 = C.Accent,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Parent = Scroll,
+		LayoutOrder = nextOrder(parent), BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 18),
+		Font = Enum.Font.GothamBold, Text = "▍" .. text, TextSize = 11, TextColor3 = C.Accent,
+		TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 8, Parent = parent,
 	})
 end
 
-local function row(height)
-	return new("Frame", {
-		LayoutOrder = nextOrder(),
-		Size = UDim2.new(1, 0, 0, height),
-		BackgroundColor3 = C.Panel,
-		Parent = Scroll,
-	}, { corner(10), stroke(C.Panel2, 1) })
+local function row(parent, height)
+	local r = new("Frame", {
+		LayoutOrder = nextOrder(parent), Size = UDim2.new(1, 0, 0, height),
+		BackgroundColor3 = C.Panel, ZIndex = 8, Parent = parent,
+	})
+	decorate(r, 11, C.Accent, 0.8, 0.12, 12)
+	return r
 end
 
 local function rowLabel(parent, text, sub)
 	new("TextLabel", {
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(14, sub and 6 or 0),
-		Size = UDim2.new(0.6, 0, 0, sub and 20 or parent.Size.Y.Offset),
-		Font = Enum.Font.GothamBold,
-		Text = text,
-		TextSize = 14,
-		TextColor3 = C.Text,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Parent = parent,
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(14, sub and 6 or 0),
+		Size = UDim2.new(0.55, 0, 0, sub and 20 or 48), Font = Enum.Font.GothamBold, Text = text,
+		TextSize = 14, TextColor3 = C.Text, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 9, Parent = parent,
 	})
 	if sub then
 		new("TextLabel", {
-			BackgroundTransparency = 1,
-			Position = UDim2.fromOffset(14, 24),
-			Size = UDim2.new(0.7, 0, 0, 14),
-			Font = Enum.Font.Gotham,
-			Text = sub,
-			TextSize = 11,
-			TextColor3 = C.Muted,
-			TextXAlignment = Enum.TextXAlignment.Left,
-			Parent = parent,
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 25), Size = UDim2.new(0.6, 0, 0, 14),
+			Font = Enum.Font.Gotham, Text = sub, TextSize = 11, TextColor3 = C.Muted,
+			TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 9, Parent = parent,
 		})
 	end
 end
 
-local toggleSetters = {}
-
-local function createToggle(text, sub, key, keyHint)
-	local r = row(46)
+local function createToggle(parent, text, sub, key, hint)
+	local r = row(parent, 48)
 	rowLabel(r, text, sub)
-	if keyHint then
+	if hint then
 		new("TextLabel", {
-			BackgroundTransparency = 1,
-			Position = UDim2.new(1, -110, 0, 0),
-			Size = UDim2.fromOffset(30, 46),
-			Font = Enum.Font.GothamBold,
-			Text = "[" .. keyHint .. "]",
-			TextSize = 11,
-			TextColor3 = C.Muted,
-			Parent = r,
+			BackgroundTransparency = 1, Position = UDim2.new(1, -112, 0, 0), Size = UDim2.fromOffset(34, 48),
+			Font = Enum.Font.GothamBold, Text = "[" .. hint .. "]", TextSize = 11, TextColor3 = C.Muted, ZIndex = 9, Parent = r,
 		})
 	end
 	local track = new("TextButton", {
-		Position = UDim2.new(1, -62, 0.5, -12),
-		Size = UDim2.fromOffset(48, 24),
-		BackgroundColor3 = C.Off,
-		Text = "",
-		AutoButtonColor = false,
-		Parent = r,
-	}, { corner(12) })
+		Position = UDim2.new(1, -62, 0.5, -12), Size = UDim2.fromOffset(48, 24), BackgroundColor3 = C.Off,
+		Text = "", AutoButtonColor = false, ZIndex = 9, Parent = r,
+	})
+	decorate(track, 12, C.Accent, 0.55, 0.3, 30)
 	local knob = new("Frame", {
-		Position = UDim2.fromOffset(3, 3),
-		Size = UDim2.fromOffset(18, 18),
-		BackgroundColor3 = C.Text,
-		Parent = track,
+		Position = UDim2.fromOffset(3, 3), Size = UDim2.fromOffset(18, 18), BackgroundColor3 = C.Text, ZIndex = 10, Parent = track,
 	}, { corner(9) })
-
-	local function apply(on)
-		tween(track, 0.15, { BackgroundColor3 = on and C.Accent or C.Off })
-		tween(knob, 0.15, { Position = on and UDim2.fromOffset(27, 3) or UDim2.fromOffset(3, 3) })
-	end
-	toggleSetters[key] = function(v)
-		Settings[key] = v
-		apply(v)
-	end
-	track.MouseButton1Click:Connect(function()
-		toggleSetters[key](not Settings[key])
+	pressable(track, 1.08)
+	listen(key, function(on)
+		tween(track, 0.18, { BackgroundColor3 = on and C.Accent or C.Off })
+		tweenE(knob, 0.22, { Position = on and UDim2.fromOffset(27, 3) or UDim2.fromOffset(3, 3) }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
 	end)
+	track.MouseButton1Click:Connect(function() setSetting(key, not Settings[key]) end)
 end
 
-local function createCycle(text, sub, key, options)
-	local r = row(46)
+local function createCycle(parent, text, sub, key, options)
+	local r = row(parent, 48)
 	rowLabel(r, text, sub)
 	local btn = new("TextButton", {
-		Position = UDim2.new(1, -124, 0.5, -15),
-		Size = UDim2.fromOffset(110, 30),
-		BackgroundColor3 = C.Panel2,
-		Text = Settings[key],
-		Font = Enum.Font.GothamBold,
-		TextSize = 12,
-		TextColor3 = C.Accent,
-		Parent = r,
-	}, { corner(8), stroke(C.Accent, 1, 0.6) })
+		Position = UDim2.new(1, -124, 0.5, -15), Size = UDim2.fromOffset(110, 30), BackgroundColor3 = C.Panel2,
+		Text = "", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = C.Accent, AutoButtonColor = false, ZIndex = 9, Parent = r,
+	})
+	decorate(btn, 8, C.Accent, 0.5, 0.25, 30)
+	pressable(btn, 1.06)
+	listen(key, function(v) btn.Text = tostring(v) end)
 	btn.MouseButton1Click:Connect(function()
 		local idx = table.find(options, Settings[key]) or 1
-		idx = idx % #options + 1
-		Settings[key] = options[idx]
-		btn.Text = options[idx]
+		setSetting(key, options[idx % #options + 1])
 	end)
 end
 
-local sliderDragging = false
-local function createSlider(text, key, min, max, step, suffix)
-	local r = row(58)
-	rowLabel(r, text)
-	r:FindFirstChildOfClass("TextLabel").Size = UDim2.new(0.6, 0, 0, 30)
+local function createSlider(parent, text, key, min, max, step, suffix)
+	local r = row(parent, 62)
+	new("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 0), Size = UDim2.new(0.6, 0, 0, 32),
+		Font = Enum.Font.GothamBold, Text = text, TextSize = 14, TextColor3 = C.Text,
+		TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 9, Parent = r,
+	})
 	local valueL = new("TextLabel", {
-		BackgroundTransparency = 1,
-		Position = UDim2.new(1, -114, 0, 0),
-		Size = UDim2.fromOffset(100, 30),
-		Font = Enum.Font.GothamBold,
-		TextSize = 13,
-		TextColor3 = C.Accent,
-		TextXAlignment = Enum.TextXAlignment.Right,
-		Parent = r,
+		BackgroundTransparency = 1, Position = UDim2.new(1, -114, 0, 0), Size = UDim2.fromOffset(100, 32),
+		Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = C.Accent,
+		TextXAlignment = Enum.TextXAlignment.Right, ZIndex = 9, Parent = r,
 	})
 	local hit = new("TextButton", {
-		Position = UDim2.fromOffset(14, 30),
-		Size = UDim2.new(1, -28, 0, 22),
-		BackgroundTransparency = 1,
-		Text = "",
-		AutoButtonColor = false,
-		Parent = r,
+		Position = UDim2.fromOffset(14, 32), Size = UDim2.new(1, -28, 0, 24),
+		BackgroundTransparency = 1, Text = "", AutoButtonColor = false, ZIndex = 9, Parent = r,
 	})
 	local track = new("Frame", {
-		Position = UDim2.new(0, 0, 0.5, -3),
-		Size = UDim2.new(1, 0, 0, 6),
-		BackgroundColor3 = C.Off,
-		Parent = hit,
+		Position = UDim2.new(0, 0, 0.5, -3), Size = UDim2.new(1, 0, 0, 6),
+		BackgroundColor3 = C.Off, BorderSizePixel = 0, ZIndex = 10, Parent = hit,
 	}, { corner(3) })
-	local fill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = C.Accent, Parent = track }, {
-		corner(3),
-		new("UIGradient", { Color = ColorSequence.new(C.Accent, C.Accent2) }),
-	})
+	local fillGrad = new("UIGradient", { Color = ColorSequence.new(C.Accent, C.Accent2) })
+	local fill = new("Frame", {
+		Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 11, Parent = track,
+	}, { corner(3), fillGrad })
+	idle({ G = fillGrad, Slide = true })
 	local knob = new("Frame", {
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.new(0, 0, 0.5, 0),
-		Size = UDim2.fromOffset(16, 16),
-		BackgroundColor3 = C.Text,
-		Parent = track,
-	}, { corner(8), stroke(C.Accent, 2) })
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.fromOffset(16, 16),
+		BackgroundColor3 = C.Text, BorderSizePixel = 0, ZIndex = 12, Parent = track,
+	}, { corner(8) })
+	local ks = stroke(C.Accent, 2, 0.2)
+	ks.Parent = knob
+	idle({ S = ks, B = 0.3, A = 0.3 })
+	local ksc = Instance.new("UIScale")
+	ksc.Parent = knob
 
-	local function render()
-		local rel = (Settings[key] - min) / (max - min)
+	listen(key, function(v)
+		local rel = (v - min) / (max - min)
 		fill.Size = UDim2.new(rel, 0, 1, 0)
 		knob.Position = UDim2.new(rel, 0, 0.5, 0)
-		valueL.Text = tostring(Settings[key]) .. suffix
-	end
+		valueL.Text = tostring(v) .. suffix
+	end)
+
 	local function setFromX(x)
 		local rel = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
 		local v = min + (max - min) * rel
-		Settings[key] = math.clamp(math.floor(v / step + 0.5) * step, min, max)
-		render()
+		setSetting(key, math.clamp(math.floor(v / step + 0.5) * step, min, max))
 	end
-	render()
 
+	local dragging = false
+	local scroller = parent
 	hit.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			sliderDragging = true
-			Scroll.ScrollingEnabled = false
-			setFromX(input.Position.X)
-			local conn
-			conn = input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					sliderDragging = false
-					Scroll.ScrollingEnabled = true
-					conn:Disconnect()
-				end
-			end)
-		end
-	end)
-	UserInputService.InputChanged:Connect(function(input)
-		if sliderDragging and hit:IsDescendantOf(Gui) then
-			if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-				-- only the slider currently under the pointer reacts
-				local p = input.Position
-				local a, s = hit.AbsolutePosition, hit.AbsoluteSize
-				if p.Y >= a.Y - 40 and p.Y <= a.Y + s.Y + 40 then
-					setFromX(p.X)
-				end
-			end
-		end
-	end)
-end
-
--- Build controls (order matches GUI connection plan)
-section("TARGET CONTROL")
-createToggle("Target Lock", "Camera follows the Head", "TargetLock", "T")
-createToggle("Aim Assist", "Smooth pull to target Head", "AimAssist", "G")
-section("BEHAVIOR")
-createCycle("Aim Smoothness", "SMOOTH → INSTANT", "Smoothness", SMOOTH_ORDER)
-createCycle("Target Mode", "Smart / Closest / Crosshair", "TargetMode", MODE_ORDER)
-createCycle("Target Part", "Head is default", "TargetPart", PART_ORDER)
-section("DETECTION")
-createSlider("FOV (360° = all directions)", "FOV", 10, 360, 10, "°")
-createSlider("Target Range", "TargetRange", 20, 500, 10, " studs")
-
--- Dragging the window
-do
-	local dragging, dragStart, startPos
-	Header.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = true
-			dragStart = input.Position
-			startPos = Main.Position
-			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then dragging = false end
-			end)
+			scroller.ScrollingEnabled = false
+			tweenE(ksc, 0.15, { Scale = 1.3 }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+			setFromX(input.Position.X)
 		end
 	end)
 	UserInputService.InputChanged:Connect(function(input)
 		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-			local d = input.Position - dragStart
-			local s = Main.Scale.Scale
-			Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X / s, startPos.Y.Scale, startPos.Y.Offset + d.Y / s)
+			setFromX(input.Position.X)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+			dragging = false
+			scroller.ScrollingEnabled = true
+			tweenE(ksc, 0.2, { Scale = 1 }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
 		end
 	end)
 end
 
--- Minimize / Close / floating "K" button
+local function createButton(parent, text, fn)
+	local r = new("TextButton", {
+		LayoutOrder = nextOrder(parent), Size = UDim2.new(1, 0, 0, 40), BackgroundColor3 = C.Accent,
+		Text = text, Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = C.Text,
+		AutoButtonColor = false, ZIndex = 8, Parent = parent,
+	})
+	decorate(r, 11, Color3.new(1, 1, 1), 0.6, 0.25, 40)
+	pressable(r, 1.03)
+	r.MouseButton1Click:Connect(fn)
+end
+
+local function createInfo(parent, text)
+	local r = row(parent, 62)
+	new("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 0), Size = UDim2.new(1, -28, 1, 0),
+		Font = Enum.Font.Gotham, Text = text, TextSize = 12, TextColor3 = C.Muted, TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 9, Parent = r,
+	})
+end
+
+--------------------------------------------------------------------
+-- PAGE 1: AIM & TARGET
+--------------------------------------------------------------------
+local Status = new("Frame", {
+	LayoutOrder = nextOrder(ScrollAim), Size = UDim2.new(1, 0, 0, 78), BackgroundColor3 = C.Panel, ZIndex = 8, Parent = ScrollAim,
+})
+decorate(Status, 12, C.Accent, 0.55, 0.2, 14)
+local StatusDot = new("Frame", {
+	Position = UDim2.fromOffset(14, 14), Size = UDim2.fromOffset(10, 10), BackgroundColor3 = C.Off, ZIndex = 9, Parent = Status,
+}, { corner(5) })
+new("TextLabel", {
+	BackgroundTransparency = 1, Position = UDim2.fromOffset(32, 8), Size = UDim2.new(1, -110, 0, 20),
+	Font = Enum.Font.GothamBold, Text = "CURRENT TARGET", TextSize = 11, TextColor3 = C.Muted,
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 9, Parent = Status,
+})
+local StatusKind = new("TextLabel", {
+	BackgroundTransparency = 1, Position = UDim2.new(1, -78, 0, 8), Size = UDim2.fromOffset(64, 20),
+	Font = Enum.Font.GothamBold, Text = "", TextSize = 11, TextColor3 = C.Accent,
+	TextXAlignment = Enum.TextXAlignment.Right, ZIndex = 9, Parent = Status,
+})
+local StatusName = new("TextLabel", {
+	BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 28), Size = UDim2.new(1, -28, 0, 20),
+	Font = Enum.Font.GothamBold, Text = "No target", TextSize = 16, TextColor3 = C.Text,
+	TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 9, Parent = Status,
+})
+local StatusDist = new("TextLabel", {
+	BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 47), Size = UDim2.new(1, -28, 0, 14),
+	Font = Enum.Font.Gotham, Text = "—", TextSize = 12, TextColor3 = C.Muted,
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 9, Parent = Status,
+})
+local BarBG = new("Frame", {
+	Position = UDim2.new(0, 14, 1, -10), Size = UDim2.new(1, -28, 0, 4),
+	BackgroundColor3 = C.Off, BorderSizePixel = 0, ZIndex = 9, Parent = Status,
+}, { corner(2) })
+local BarGrad = new("UIGradient", { Color = ColorSequence.new(C.Accent, C.Accent2) })
+local BarFill = new("Frame", {
+	Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 10, Parent = BarBG,
+}, { corner(2), BarGrad })
+idle({ G = BarGrad, Slide = true })
+
+section(ScrollAim, "TARGET CONTROL")
+createToggle(ScrollAim, "Target Lock", "Camera locks on the Head", "TargetLock", "T")
+createToggle(ScrollAim, "Aim Assist", "Fast smooth pull to Head", "AimAssist", "G")
+createCycle(ScrollAim, "Aim Smoothness", "SMOOTH → INSTANT", "Smoothness", SMOOTH_ORDER)
+section(ScrollAim, "TARGETING")
+createCycle(ScrollAim, "Target Mode", "Nearest = closest first", "TargetMode", MODE_ORDER)
+createCycle(ScrollAim, "Target Part", "Head is default", "TargetPart", PART_ORDER)
+section(ScrollAim, "DETECTION")
+createSlider(ScrollAim, "FOV Circle Size", "FOVRadius", 40, 700, 10, " px")
+createSlider(ScrollAim, "Target Range", "TargetRange", 20, 500, 10, " studs")
+
+--------------------------------------------------------------------
+-- PAGE 2: SETTINGS
+--------------------------------------------------------------------
+section(ScrollSet, "SYSTEM")
+createToggle(ScrollSet, "Target System", "Highlight • Billboard • Distance", "TargetSystem")
+createToggle(ScrollSet, "Include NPCs", "NPC / humanoid targets", "IncludeNPC")
+section(ScrollSet, "DETECTION")
+createToggle(ScrollSet, "360° Detection", "OFF = FOV circle is hard limit", "Detect360")
+createToggle(ScrollSet, "Show FOV Circle", "Center screen circle", "ShowFOV")
+section(ScrollSet, "VISUAL")
+createCycle(ScrollSet, "Highlight Color", "Highlight + TARGET text", "HighlightColor", HL_ORDER)
+section(ScrollSet, "INFO")
+createInfo(ScrollSet, "Kyzen Perks " .. VERSION .. "\n" .. CREDIT .. "\nT = Lock  •  G = Aim  •  RShift = Menu")
+createButton(ScrollSet, "↺  Reset Defaults", function()
+	for k, v in pairs(Defaults) do setSetting(k, v) end
+end)
+
+--------------------------------------------------------------------
+-- TABS
+--------------------------------------------------------------------
+local Indicator = new("Frame", {
+	Size = UDim2.fromOffset(4, 26), Position = UDim2.fromOffset(4, 15),
+	BackgroundColor3 = Color3.new(1, 1, 1), ZIndex = 10, Parent = Sidebar,
+}, { corner(2) })
+local IndGrad = new("UIGradient", { Rotation = 90, Color = ColorSequence.new(C.Accent, C.Accent2), Parent = Indicator })
+idle({ G = IndGrad, Slide = true })
+
+local Tabs = {}
+local currentTab
+
+local function selectTab(i, instant)
+	if currentTab == i then return end
+	local prev = currentTab
+	currentTab = i
+	for j, t in ipairs(Tabs) do
+		tween(t.Btn, 0.2, { BackgroundColor3 = (j == i) and C.Accent or C.Panel2 })
+		tween(t.Btn, 0.2, { TextColor3 = (j == i) and Color3.new(1, 1, 1) or C.Muted })
+	end
+	tweenE(Indicator, 0.3, { Position = UDim2.fromOffset(4, Tabs[i].Btn.Position.Y.Offset + 7) }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
+	if prev then
+		local op = Tabs[prev].Page
+		tween(op, 0.12, { GroupTransparency = 1 })
+		task.delay(0.13, function()
+			if currentTab ~= prev then op.Visible = false end
+		end)
+	end
+	local np = Tabs[i].Page
+	np.Visible = true
+	np.Position = UDim2.fromOffset(0, instant and 0 or 14)
+	np.GroupTransparency = instant and 0 or 1
+	tween(np, 0.25, { GroupTransparency = 0, Position = UDim2.fromOffset(0, 0) })
+end
+
+local function createTab(index, text, page)
+	local btn = new("TextButton", {
+		Position = UDim2.fromOffset(14, 8 + (index - 1) * 48), Size = UDim2.new(1, -24, 0, 40),
+		BackgroundColor3 = C.Panel2, Text = text, Font = Enum.Font.GothamBold, TextSize = 12,
+		TextColor3 = C.Muted, AutoButtonColor = false, ZIndex = 9, Parent = Sidebar,
+	})
+	decorate(btn, 10, C.Accent, 0.55, 0.25, 30)
+	pressable(btn, 1.04)
+	Tabs[index] = { Btn = btn, Page = page }
+	btn.MouseButton1Click:Connect(function() selectTab(index, false) end)
+end
+createTab(1, "🎯  Aim & Target", PageAim)
+createTab(2, "⚙️  Settings", PageSet)
+selectTab(1, true)
+
+--------------------------------------------------------------------
+-- WINDOW BEHAVIOR (minimize / close / draggable image toggle)
+--------------------------------------------------------------------
 local minimized = false
 MinBtn.MouseButton1Click:Connect(function()
 	minimized = not minimized
-	Body.Visible = not minimized
-	tween(Main, 0.2, { Size = minimized and UDim2.fromOffset(320, 48) or UDim2.fromOffset(320, 500) })
+	if minimized then
+		Body.Visible = false
+		tween(Main, 0.22, { Size = UDim2.fromOffset(MAIN_W, HEADER_H) })
+	else
+		tween(Main, 0.25, { Size = UDim2.fromOffset(MAIN_W, MAIN_H) })
+		task.delay(0.1, function() if not minimized then Body.Visible = true end end)
+	end
 	MinBtn.Text = minimized and "+" or "–"
 end)
 
-local FloatBtn = new("TextButton", {
-	Name = "KyzenToggle",
-	Size = UDim2.fromOffset(42, 42),
-	Position = UDim2.fromOffset(14, 90),
-	BackgroundColor3 = C.Accent,
-	Text = "K",
-	Font = Enum.Font.GothamBlack,
-	TextSize = 20,
-	TextColor3 = C.Text,
-	Parent = Gui,
-}, { corner(21), stroke(Color3.fromRGB(255, 190, 190), 2, 0.3) })
-
+local menuOpen = true
 local function setMenu(v)
-	Main.Visible = v
+	menuOpen = v
+	if v then
+		Main.Scale.Scale = baseScale * 0.85
+		Main.Visible = true
+		tweenE(Main.Scale, 0.28, { Scale = baseScale }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	else
+		tween(Main.Scale, 0.15, { Scale = baseScale * 0.85 })
+		task.delay(0.16, function()
+			if not menuOpen then Main.Visible = false end
+		end)
+	end
 end
 CloseBtn.MouseButton1Click:Connect(function() setMenu(false) end)
-FloatBtn.MouseButton1Click:Connect(function() setMenu(not Main.Visible) end)
 
--- Live status card
+-- Toggle button = ImageButton (draggable)
+local FloatBtn = new("ImageButton", {
+	Name = "KyzenToggle", Size = UDim2.fromOffset(50, 50), Position = UDim2.fromOffset(12, 96),
+	BackgroundColor3 = C.Panel, BackgroundTransparency = 0,
+	Image = TOGGLE_IMAGE, ScaleType = Enum.ScaleType.Crop, ImageColor3 = Color3.new(1, 1, 1),
+	AutoButtonColor = false, ZIndex = 20, Parent = Gui,
+})
+corner(25).Parent = FloatBtn
+local FloatStroke = stroke(C.Accent, 1.6, 0.2)
+FloatStroke.Parent = FloatBtn
+local FloatGrad = new("UIGradient", {
+	Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(170, 170, 180)), Parent = FloatStroke,
+})
+idle({ S = FloatStroke, B = 0.25, A = 0.3, G = FloatGrad, Spin = 60 })
+pressable(FloatBtn, 1.1)
+makeDraggable(FloatBtn, FloatBtn, nil, function() setMenu(not menuOpen) end)
+
+--------------------------------------------------------------------
+-- LIVE STATUS
+--------------------------------------------------------------------
 local statusAcc = 0
 RunService.Heartbeat:Connect(function(dt)
 	statusAcc += dt
 	if statusAcc < 0.1 then return end
 	statusAcc = 0
-	local t = State.Current
-	if t then
+
+	local m = State.Current
+	if m then
+		local nm, kind = describe(m)
 		StatusDot.BackgroundColor3 = C.Good
-		StatusName.Text = (t.DisplayName ~= t.Name) and (t.DisplayName .. "  @" .. t.Name) or ("@" .. t.Name)
-		local _, _, root = getParts(t)
+		StatusName.Text = nm
+		StatusKind.Text = kind
+		local _, root = getParts(m)
 		local myRoot = getMyRoot()
 		if root and myRoot then
-			StatusDist.Text = string.format("%.1f studs  •  %s mode", (root.Position - myRoot.Position).Magnitude, Settings.TargetMode)
+			local d = (root.Position - myRoot.Position).Magnitude
+			StatusDist.Text = string.format("%.1f studs  •  %s", d, Settings.TargetMode)
+			BarFill.Size = UDim2.new(1 - math.clamp(d / Settings.TargetRange, 0, 1), 0, 1, 0)
 		end
+		CircleStroke.Color = C.Good
+		Circle.BackgroundColor3 = C.Good
+		CircleLabel.TextColor3 = C.Good
 	else
 		StatusDot.BackgroundColor3 = C.Off
 		StatusName.Text = "No target"
-		StatusDist.Text = (Settings.TargetLock or Settings.AimAssist) and "Searching..." or "Turn on Target Lock / Aim Assist"
+		StatusKind.Text = ""
+		StatusDist.Text = "Searching for nearest target..."
+		BarFill.Size = UDim2.new(0, 0, 1, 0)
+		CircleStroke.Color = C.Accent
+		Circle.BackgroundColor3 = C.Accent
+		CircleLabel.TextColor3 = C.Accent
 	end
 end)
 
--- Keybinds
+--------------------------------------------------------------------
+-- KEYBINDS / CLEANUP
+--------------------------------------------------------------------
 UserInputService.InputBegan:Connect(function(input, processed)
 	if processed then return end
 	if input.KeyCode == Enum.KeyCode.RightShift then
-		setMenu(not Main.Visible)
+		setMenu(not menuOpen)
 	elseif input.KeyCode == Enum.KeyCode.T then
-		toggleSetters.TargetLock(not Settings.TargetLock)
+		setSetting("TargetLock", not Settings.TargetLock)
 	elseif input.KeyCode == Enum.KeyCode.G then
-		toggleSetters.AimAssist(not Settings.AimAssist)
+		setSetting("AimAssist", not Settings.AimAssist)
 	end
 end)
 
--- Cleanup
 Players.PlayerRemoving:Connect(function(p)
-	if State.Current == p then
+	if State.Current and State.Current == p.Character then
 		clearTarget()
 		updateTarget()
 	end
 end)
 
--- Respawn of local player: reset so we never hold a stale target
 LocalPlayer.CharacterAdded:Connect(function()
 	clearTarget()
 end)
